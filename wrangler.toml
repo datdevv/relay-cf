@@ -1,0 +1,12 @@
+name = "figager-relay"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "Relay"
+
+# SQLite-backed Durable Objects are available on the Workers FREE plan.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Relay"]

@@ -1,0 +1,14 @@
+{
+  "name": "figager-relay",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "3.99.0",
+    "@cloudflare/workers-types": "4.20250109.0"
+  }
+}
