@@ -16,24 +16,30 @@ export class Relay {
   // Big base64 textures live in memory only; re-streamed by the plugin on
   // connect. scene/library persist to storage (see brief §2).
   assets: Map<string, string>;
-  // The shared LAND (player builds): cell key "x,y,z" -> { val, ts }. Accumulated
-  // from `op` messages with last-write-wins, persisted per-cell to DO storage
-  // (keys "b:<cell>"), and snapshotted to every joiner. Lazily loaded.
-  land: Map<string, { val: unknown; ts: number }> | null;
+  // Player builds, namespaced PER LAND so separate ?land=<id> worlds don't mix
+  // while CONTENT (scene/library/assets) stays shared in this one DO. lands:
+  // landId -> (cell "x,y,z" -> {val,ts}); persisted as "b:<land>:<cell>". Lazy.
+  lands: Map<string, Map<string, { val: unknown; ts: number }>>;
 
   constructor(state: DurableObjectState, env: unknown) {
     this.state = state;
     this.env = env;
     this.assets = new Map();
-    this.land = null;
+    this.lands = new Map();
   }
 
-  // Lazily hydrate the land from DO storage (survives hibernation/cold start).
-  async ensureLand(): Promise<void> {
-    if (this.land) return;
-    this.land = new Map();
-    const rows = (await this.state.storage.list({ prefix: 'b:' })) as Map<string, { val: unknown; ts: number }>;
-    for (const [k, v] of rows) this.land.set(k.slice(2), v);
+  static landId(raw: string | null): string { return ((raw || 'home').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 48)) || 'home'; }
+
+  // Lazily hydrate ONE land from DO storage (survives hibernation/cold start).
+  async ensureLand(landId: string): Promise<Map<string, { val: unknown; ts: number }>> {
+    let m = this.lands.get(landId);
+    if (m) return m;
+    m = new Map();
+    const pre = 'b:' + landId + ':';
+    const rows = (await this.state.storage.list({ prefix: pre })) as Map<string, { val: unknown; ts: number }>;
+    for (const [k, v] of rows) m.set(k.slice(pre.length), v);
+    this.lands.set(landId, m);
+    return m;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -61,26 +67,27 @@ export class Relay {
       const client = pair[0];
       const server = pair[1];
       this.state.acceptWebSocket(server);     // Hibernation API: idle rooms cost nothing
-      await this.seed(server);                // late-joiner cache
+      await this.seed(server, Relay.landId(url.searchParams.get('land'))); // shared content + this land's build
       return new Response(null, { status: 101, webSocket: client });
     }
 
     return cors(new Response('relay ok', { status: 200 }));
   }
 
-  // Seed a freshly-connected peer with the current world.
-  async seed(ws: WebSocket): Promise<void> {
+  // Seed a freshly-connected peer: CONTENT (global) + the build of the land it
+  // joined (?land=<id>), so late joiners see that land's full build.
+  async seed(ws: WebSocket, landId: string): Promise<void> {
     const scene = (await this.state.storage.get('scene')) as string | undefined;
     const library = (await this.state.storage.get('library')) as string | undefined;
-    await this.ensureLand();
+    const land = await this.ensureLand(landId);
     try {
       if (scene) ws.send(scene);
       if (library) ws.send(library);
       for (const frame of this.assets.values()) ws.send(frame);
-      if (this.land!.size) {                       // the full shared build, so late joiners see everything
+      if (land.size) {
         const blocks: Record<string, { val: unknown; ts: number }> = {};
-        for (const [k, e] of this.land!) blocks[k] = e;
-        ws.send(JSON.stringify({ type: 'land', blocks }));
+        for (const [k, e] of land) blocks[k] = e;
+        ws.send(JSON.stringify({ type: 'land', land: landId, blocks }));
       }
     } catch {}
   }
@@ -96,16 +103,18 @@ export class Relay {
         this.assets.set(msg.key || msg.nodeId, text);
       }
       else if (msg.type === 'op' && Array.isArray(msg.ops)) {
-        // Build edits: accumulate into the canonical land (last-write-wins per
-        // cell) and persist per-cell, so the land survives + seeds late joiners.
-        await this.ensureLand();
+        // Build edits for ONE land: accumulate (last-write-wins per cell) and
+        // persist per-cell under that land, so it survives + seeds late joiners.
+        const landId = Relay.landId(msg.land);
+        const land = await this.ensureLand(landId);
+        const pre = 'b:' + landId + ':';
         const puts: Record<string, { val: unknown; ts: number }> = {};
         const dels: string[] = [];
         for (const o of msg.ops) {
-          const cur = this.land!.get(o.key);
+          const cur = land.get(o.key);
           if (cur && cur.ts > (o.ts || 0)) continue;        // keep the newer edit
-          if (o.op === 'd') { this.land!.delete(o.key); dels.push('b:' + o.key); }
-          else { const e = { val: o.val, ts: o.ts || 0 }; this.land!.set(o.key, e); puts['b:' + o.key] = e; }
+          if (o.op === 'd') { land.delete(o.key); dels.push(pre + o.key); }
+          else { const e = { val: o.val, ts: o.ts || 0 }; land.set(o.key, e); puts[pre + o.key] = e; }
         }
         if (Object.keys(puts).length) await this.state.storage.put(puts);
         if (dels.length) await this.state.storage.delete(dels);
