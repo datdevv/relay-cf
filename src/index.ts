@@ -28,6 +28,10 @@ export default {
     // content host. `?land` (read inside relay.ts) still namespaces BUILDS WITHIN
     // a room — orthogonal to ?room, which picks the whole DO (content + builds).
     const url = new URL(request.url);
+    // The Visit-grid directory (active rooms + thumbnails) lives on ONE singleton DO.
+    if (url.pathname === '/rooms' || url.pathname === '/report' || url.pathname === '/thumb') {
+      return env.RELAY.get(env.RELAY.idFromName(ROOM_NS + ':__directory__')).fetch(request);
+    }
     const room = (url.searchParams.get('room') || 'figager')
       .toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 48) || 'figager';
     const id = env.RELAY.idFromName(ROOM_NS + ':' + room);

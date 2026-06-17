@@ -57,6 +57,56 @@ export class Relay {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
 
+    // --- room directory (Visit grid). These routes are sent to ONE singleton DO by
+    // index.ts, so this storage is the global registry of active worlds. Clients POST
+    // /report ~every 15s with {room, clientId, owner, destroyable}; each room entry
+    // tracks recent clientIds (=live player count). The owner POSTs a canvas snapshot
+    // to /thumb. /rooms returns active worlds for the grid.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sanRoom = (s: any) => String(s || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 48);
+    if (request.method === 'POST' && url.pathname === '/report') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let body: any = {}; try { body = await request.json(); } catch {}
+      const room = sanRoom(body.room);
+      if (!room || room === 'figager') return cors(json({ ok: false })); // the lobby isn't listed
+      const cid = String(body.clientId || 'anon').slice(0, 32);
+      const now = Date.now();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const e: any = (await this.state.storage.get('dir:' + room)) || { clients: {}, destroyable: false };
+      e.clients[cid] = now;
+      for (const k in e.clients) if (now - e.clients[k] > 45000) delete e.clients[k];
+      e.players = Object.keys(e.clients).length;
+      if (typeof body.destroyable === 'boolean') e.destroyable = body.destroyable;
+      e.ts = now;
+      await this.state.storage.put('dir:' + room, e);
+      return cors(json({ ok: true, players: e.players }));
+    }
+    if (request.method === 'GET' && url.pathname === '/rooms') {
+      const now = Date.now();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rows = (await this.state.storage.list({ prefix: 'dir:' })) as Map<string, any>;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const out: any[] = [];
+      for (const [k, e] of rows) {
+        let players = 0; for (const c in (e.clients || {})) if (now - e.clients[c] <= 45000) players++;
+        if (players > 0) out.push({ room: k.slice(4), players, destroyable: !!e.destroyable });
+      }
+      out.sort((a, b) => b.players - a.players || a.room.localeCompare(b.room));
+      return cors(json({ rooms: out.slice(0, 60) }));
+    }
+    if (url.pathname === '/thumb') {
+      const room = sanRoom(url.searchParams.get('room'));
+      if (!room) return cors(new Response('no room', { status: 400 }));
+      if (request.method === 'POST') {
+        const data = await request.text();
+        if (data && data.length < 240000) await this.state.storage.put('thumb:' + room, data);
+        return cors(json({ ok: true }));
+      }
+      const t = (await this.state.storage.get('thumb:' + room)) as string | undefined;
+      if (!t) return cors(new Response('', { status: 404 }));
+      return cors(new Response(t, { headers: { 'content-type': 'text/plain' } }));
+    }
+
     // Player-mode fallback: frozen snapshot.
     if (request.method === 'GET' && url.pathname === '/published.json') {
       const snap = ((await this.state.storage.get('published')) as string) || EMPTY_SCENE;
