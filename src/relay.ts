@@ -16,6 +16,7 @@ export class Relay {
   // Big base64 textures live in memory only; re-streamed by the plugin on
   // connect. scene/library persist to storage (see brief §2).
   assets: Map<string, string>;
+  assetsLoaded: boolean;
   // Player builds, namespaced PER LAND so separate ?land=<id> worlds don't mix
   // while CONTENT (scene/library/assets) stays shared in this one DO. lands:
   // landId -> (cell "x,y,z" -> {val,ts}); persisted as "b:<land>:<cell>". Lazy.
@@ -25,7 +26,17 @@ export class Relay {
     this.state = state;
     this.env = env;
     this.assets = new Map();
+    this.assetsLoaded = false;
     this.lands = new Map();
+  }
+
+  // Lazily hydrate textures from DO storage so CONTENT survives eviction / days
+  // with no plugin connected (small pixel-art PNGs are well under the value limit).
+  async ensureAssets(): Promise<void> {
+    if (this.assetsLoaded) return;
+    this.assetsLoaded = true;
+    const rows = (await this.state.storage.list({ prefix: 'a:' })) as Map<string, string>;
+    for (const [k, v] of rows) { const key = k.slice(2); if (!this.assets.has(key)) this.assets.set(key, v); }
   }
 
   static landId(raw: string | null): string { return ((raw || 'home').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 48)) || 'home'; }
@@ -80,6 +91,7 @@ export class Relay {
     const scene = (await this.state.storage.get('scene')) as string | undefined;
     const library = (await this.state.storage.get('library')) as string | undefined;
     const land = await this.ensureLand(landId);
+    await this.ensureAssets(); // load persisted textures so a cold start / no-plugin world still has them
     try {
       if (scene) ws.send(scene);
       if (library) ws.send(library);
@@ -100,7 +112,9 @@ export class Relay {
       if (msg.type === 'scene') await this.state.storage.put('scene', text);
       else if (msg.type === 'library') await this.state.storage.put('library', text);
       else if (msg.type === 'asset' && (msg.key || msg.nodeId)) {
-        this.assets.set(msg.key || msg.nodeId, text);
+        const ak = msg.key || msg.nodeId;
+        this.assets.set(ak, text);
+        try { await this.state.storage.put('a:' + ak, text); } catch {} // persist so textures survive eviction / no-plugin days
       }
       else if (msg.type === 'op' && Array.isArray(msg.ops)) {
         // Build edits for ONE land: accumulate (last-write-wins per cell) and
