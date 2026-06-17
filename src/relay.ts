@@ -78,7 +78,8 @@ export class Relay {
       const admin = (this.env as { ADMIN_KEY?: string }).ADMIN_KEY;
       if (!admin || url.searchParams.get('key') !== admin) return cors(json({ ok: false, reason: 'forbidden' }));
       await this.state.storage.delete('owner');
-      return cors(json({ ok: true, reset: 'owner' }));
+      await this.state.storage.delete('destroyable');
+      return cors(json({ ok: true, reset: 'owner+destroyable' }));
     }
 
     // WebSocket upgrade → join the room.
@@ -110,6 +111,12 @@ export class Relay {
         for (const [k, e] of land) blocks[k] = e;
         ws.send(JSON.stringify({ type: 'land', land: landId, blocks }));
       }
+      // Tell the joiner whether this room is owned + open to building, so its UI can
+      // show/hide build tools. (authResult, sent after the client's auth, says whether
+      // THIS socket is the owner.)
+      const owner = (await this.state.storage.get('owner')) as string | undefined;
+      const destroyable = (await this.state.storage.get('destroyable')) === true;
+      ws.send(JSON.stringify({ type: 'roomState', owned: !!owner, destroyable }));
     } catch {}
   }
 
@@ -132,9 +139,33 @@ export class Relay {
       return;
     }
 
+    // Owner toggles "destroyable" (= buildable by everyone). Authed-only; the new
+    // roomState is broadcast to all peers so their build UI updates immediately.
+    if (msg && msg.type === 'setDestroyable') {
+      const att = ws.deserializeAttachment() as { authed?: boolean } | null;
+      if (!(att && att.authed)) return; // only the owner may change it
+      await this.state.storage.put('destroyable', !!msg.value);
+      const owner = (await this.state.storage.get('owner')) as string | undefined;
+      const rs = JSON.stringify({ type: 'roomState', owned: !!owner, destroyable: !!msg.value });
+      for (const peer of this.state.getWebSockets()) { if (peer.readyState === WebSocket.OPEN) { try { peer.send(rs); } catch {} } }
+      return;
+    }
+
+    // BUILD gating: building — op (persistent edits) and carry (held / in-flight block
+    // ghosts) — is allowed ONLY for the authed owner OR when the room is "destroyable"
+    // (open to everyone). Otherwise the room is read-only: drop it (not persisted, not
+    // fanned out). This is what makes "read-only by default" server-enforced.
+    if (msg && (msg.type === 'op' || msg.type === 'carry')) {
+      const att = ws.deserializeAttachment() as { authed?: boolean } | null;
+      if (!(att && att.authed)) {
+        const destroyable = (await this.state.storage.get('destroyable')) === true;
+        if (!destroyable) return;
+      }
+    }
+
     // CONTENT writes (scene/library/asset) require ownership once a room is
     // claimed; a non-owner is read-only (its content is dropped — not cached, not
-    // fanned out). Builds (op) / presence / hello are NOT gated.
+    // fanned out). presence / hello are NOT gated.
     const isContent = !!msg && (msg.type === 'scene' || msg.type === 'library' || (msg.type === 'asset' && (msg.key || msg.nodeId)));
     if (isContent) {
       const owner = (await this.state.storage.get('owner')) as string | undefined;
