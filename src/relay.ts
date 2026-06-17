@@ -104,19 +104,44 @@ export class Relay {
     } catch {}
   }
 
-  // Every inbound frame: sniff for caching, then fan out to all OTHER peers.
+  // Every inbound frame: auth-gate CONTENT writes, sniff for caching, fan out.
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const text = typeof message === 'string' ? message : new TextDecoder().decode(message);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let msg: any = null;
+    try { msg = JSON.parse(text); } catch {}
+
+    // Owner claim / verify. The token is NEVER cached or fanned out (so visitors
+    // can't sniff it). The first token to arrive claims an unowned room.
+    if (msg && msg.type === 'auth') {
+      const owner = (await this.state.storage.get('owner')) as string | undefined;
+      let authed = false;
+      if (!owner) { if (msg.token) { await this.state.storage.put('owner', String(msg.token)); authed = true; } }
+      else authed = owner === String(msg.token);
+      ws.serializeAttachment({ authed });
+      try { ws.send(JSON.stringify({ type: 'authResult', owner: authed })); } catch {}
+      return;
+    }
+
+    // CONTENT writes (scene/library/asset) require ownership once a room is
+    // claimed; a non-owner is read-only (its content is dropped — not cached, not
+    // fanned out). Builds (op) / presence / hello are NOT gated.
+    const isContent = !!msg && (msg.type === 'scene' || msg.type === 'library' || (msg.type === 'asset' && (msg.key || msg.nodeId)));
+    if (isContent) {
+      const owner = (await this.state.storage.get('owner')) as string | undefined;
+      const att = ws.deserializeAttachment() as { authed?: boolean } | null;
+      if (owner && !(att && att.authed)) return; // not the owner -> ignore content
+    }
+
     try {
-      const msg = JSON.parse(text);
-      if (msg.type === 'scene') await this.state.storage.put('scene', text);
-      else if (msg.type === 'library') await this.state.storage.put('library', text);
-      else if (msg.type === 'asset' && (msg.key || msg.nodeId)) {
+      if (msg && msg.type === 'scene') await this.state.storage.put('scene', text);
+      else if (msg && msg.type === 'library') await this.state.storage.put('library', text);
+      else if (msg && msg.type === 'asset' && (msg.key || msg.nodeId)) {
         const ak = msg.key || msg.nodeId;
         this.assets.set(ak, text);
         try { await this.state.storage.put('a:' + ak, text); } catch {} // persist so textures survive eviction / no-plugin days
       }
-      else if (msg.type === 'op' && Array.isArray(msg.ops)) {
+      else if (msg && msg.type === 'op' && Array.isArray(msg.ops)) {
         // Build edits for ONE land: accumulate (last-write-wins per cell) and
         // persist per-cell under that land, so it survives + seeds late joiners.
         const landId = Relay.landId(msg.land);
@@ -133,7 +158,7 @@ export class Relay {
         if (Object.keys(puts).length) await this.state.storage.put(puts);
         if (dels.length) await this.state.storage.delete(dels);
       }
-      // hello/write/resync/patch: nothing to cache — just forwarded below.
+      // hello/write/resync/patch/presence/carry: nothing to cache — just forwarded.
     } catch { /* non-JSON or partial — still forward verbatim */ }
 
     for (const peer of this.state.getWebSockets()) {
