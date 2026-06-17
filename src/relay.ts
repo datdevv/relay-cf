@@ -72,6 +72,15 @@ export class Relay {
       return cors(json({ ok: true, ts }));
     }
 
+    // Admin reset: clear a room's owner so it can be re-claimed. Gated by the
+    // ADMIN_KEY wrangler secret (disabled if unset) — POST /reset?room=&key=.
+    if (request.method === 'POST' && url.pathname === '/reset') {
+      const admin = (this.env as { ADMIN_KEY?: string }).ADMIN_KEY;
+      if (!admin || url.searchParams.get('key') !== admin) return cors(json({ ok: false, reason: 'forbidden' }));
+      await this.state.storage.delete('owner');
+      return cors(json({ ok: true, reset: 'owner' }));
+    }
+
     // WebSocket upgrade → join the room.
     if ((request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
       const pair = new WebSocketPair();

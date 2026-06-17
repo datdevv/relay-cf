@@ -2,6 +2,7 @@ export { Relay } from './relay';
 
 export interface Env {
   RELAY: DurableObjectNamespace;
+  ADMIN_KEY?: string; // wrangler secret; enables POST /reset?room=&key= to clear a room owner
 }
 
 export default {
