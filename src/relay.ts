@@ -130,10 +130,13 @@ export class Relay {
     // Owner claim / verify. The token is NEVER cached or fanned out (so visitors
     // can't sniff it). The first token to arrive claims an unowned room.
     if (msg && msg.type === 'auth') {
+      const token = String(msg.token || '');
+      const master = (this.env as { OWNER_KEY?: string }).OWNER_KEY; // wrangler secret; owns any room (the lobby) — never in the repo
       const owner = (await this.state.storage.get('owner')) as string | undefined;
       let authed = false;
-      if (!owner) { if (msg.token) { await this.state.storage.put('owner', String(msg.token)); authed = true; } }
-      else authed = owner === String(msg.token);
+      if (master && token && token === master) { authed = true; if (!owner) await this.state.storage.put('owner', token); } // operator master key -> owner of this room
+      else if (!owner) { if (token) { await this.state.storage.put('owner', token); authed = true; } }                      // first token claims an unowned room
+      else authed = owner === token;                                                                                        // otherwise must match the claimer
       ws.serializeAttachment({ authed });
       try { ws.send(JSON.stringify({ type: 'authResult', owner: authed })); } catch {}
       return;

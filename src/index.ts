@@ -3,7 +3,15 @@ export { Relay } from './relay';
 export interface Env {
   RELAY: DurableObjectNamespace;
   ADMIN_KEY?: string; // wrangler secret; enables POST /reset?room=&key= to clear a room owner
+  OWNER_KEY?: string; // wrangler secret; a MASTER owner key — presenting it as the auth token owns any room (e.g. the lobby). Set with `wrangler secret put OWNER_KEY`; never in the repo.
 }
+
+// Routing namespace. BUMP this to RESET EVERY ROOM: each room then resolves to a
+// brand-new empty Durable Object, so all worlds (lobby + every player room: content,
+// builds, owners, destroyable) start fresh. The old DOs are simply orphaned (idle =
+// free). Reversible — set it back to reach the old data. Rooms stay addressed by
+// their plain ?room id (this prefix is invisible to users).
+const ROOM_NS = 'g2';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -22,7 +30,7 @@ export default {
     const url = new URL(request.url);
     const room = (url.searchParams.get('room') || 'figager')
       .toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 48) || 'figager';
-    const id = env.RELAY.idFromName(room);
+    const id = env.RELAY.idFromName(ROOM_NS + ':' + room);
     return env.RELAY.get(id).fetch(request);
   },
 };
