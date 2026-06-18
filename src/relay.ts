@@ -211,7 +211,11 @@ export class Relay {
     try {
       if (scene) ws.send(scene);
       if (library) ws.send(library);
-      for (const frame of this.assets.values()) ws.send(frame);
+      // DELTA SEED: send only a MANIFEST (asset key -> byte length), not the bodies. The client
+      // requests just the textures it's missing or whose length changed, so a reconnect / return
+      // visit re-streams ~nothing while a re-exported texture still updates.
+      const amani: Record<string, number> = {}; for (const [k, v] of this.assets) amani[k] = v.length;
+      ws.send(JSON.stringify({ type: 'amani', keys: amani }));
       if (land.size) {
         const blocks: Record<string, { val: unknown; ts: number }> = {};
         for (const [k, e] of land) blocks[k] = e;
@@ -247,6 +251,14 @@ export class Relay {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let msg: any = null;
     try { msg = JSON.parse(text); } catch {}
+
+    // DELTA SEED: the client asks for the specific asset keys it doesn't have cached. Public read
+    // (textures are content), batch-capped so it can't be used to amplify load.
+    if (msg && msg.type === 'want' && Array.isArray(msg.keys)) {
+      await this.ensureAssets();
+      for (const k of msg.keys.slice(0, 6000)) { const f = this.assets.get(k); if (f) { try { ws.send(f); } catch {} } }
+      return;
+    }
 
     // Owner claim / verify. The token is NEVER cached or fanned out (so visitors
     // can't sniff it). The first token to arrive claims an unowned room.
