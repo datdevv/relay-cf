@@ -217,6 +217,10 @@ export class Relay {
       // Race course is room-wide content: replay the persisted course to late joiners.
       const race = (await this.state.storage.get('race')) as string | undefined;
       if (race) { try { ws.send(JSON.stringify({ type: 'race', race: JSON.parse(race) })); } catch {} }
+      // ...and the current leaderboard, so finish times are there before you race.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lb = (await this.state.storage.get('lb')) as any[] | undefined;
+      if (lb && lb.length) { try { ws.send(JSON.stringify({ type: 'leaderboard', entries: lb })); } catch {} }
     } catch {}
   }
 
@@ -279,6 +283,43 @@ export class Relay {
         if (!destroyable) return;
       }
       try { await this.state.storage.put('race', JSON.stringify(msg.race || null)); } catch {}
+    }
+
+    // Owner WIPE: clear everything the players BUILT (all b:<land>:* builds + the race
+    // course). Content (scene/library/textures) and ownership/destroyable stay, so the
+    // world is reborn empty but still textured + still yours. Authed owner only. Then
+    // tell every peer to reload into the fresh world.
+    if (msg && msg.type === 'wipe') {
+      const att = ws.deserializeAttachment() as { authed?: boolean } | null;
+      if (!(att && att.authed)) return; // owner only
+      try {
+        const keys = [...(await this.state.storage.list({ prefix: 'b:' })).keys()];
+        for (let i = 0; i < keys.length; i += 100) await this.state.storage.delete(keys.slice(i, i + 100));
+        await this.state.storage.delete('race');
+      } catch {}
+      this.lands.clear();
+      try { await this.state.storage.delete('lb'); } catch {} // fresh world -> fresh leaderboard
+      const w = JSON.stringify({ type: 'wiped' });
+      for (const peer of this.state.getWebSockets()) { if (peer.readyState === WebSocket.OPEN) { try { peer.send(w); } catch {} } }
+      return;
+    }
+
+    // Race FINISH: anyone racing can submit {name,time}. Keep the top-10 fastest per room
+    // (this DO = this room) under "lb", then broadcast the updated board to everyone.
+    if (msg && msg.type === 'finish') {
+      const time = Number(msg.time);
+      if (isFinite(time) && time > 0 && time < 36000) {
+        const name = String(msg.name || 'anon').slice(0, 24);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let lb = ((await this.state.storage.get('lb')) as any[]) || [];
+        lb.push({ name, time });
+        lb.sort((a, b) => a.time - b.time);
+        lb = lb.slice(0, 10);
+        try { await this.state.storage.put('lb', lb); } catch {}
+        const m2 = JSON.stringify({ type: 'leaderboard', entries: lb });
+        for (const peer of this.state.getWebSockets()) { if (peer.readyState === WebSocket.OPEN) { try { peer.send(m2); } catch {} } }
+      }
+      return;
     }
 
     // CONTENT writes (scene/library/asset) require ownership once a room is
