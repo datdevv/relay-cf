@@ -167,11 +167,22 @@ export class Relay {
       return cors(json({ ok: true, ts }));
     }
 
-    // Admin reset: clear a room's owner so it can be re-claimed. Gated by the
-    // ADMIN_KEY wrangler secret (disabled if unset) — POST /reset?room=&key=.
+    // Reset a room. Gated by the ADMIN_KEY OR the master OWNER_KEY secret. POST /reset?room=&key=
+    //   (default)  -> clear just owner/destroyable so the room can be re-claimed (keeps content)
+    //   &full=1    -> GENUINE reset: wipe the whole world (builds, textures, scene, library, owner,
+    //                 race, leaderboard, thumb, …) so it's reborn empty + unowned; reload live peers.
     if (request.method === 'POST' && url.pathname === '/reset') {
-      const admin = (this.env as { ADMIN_KEY?: string }).ADMIN_KEY;
-      if (!admin || url.searchParams.get('key') !== admin) return cors(json({ ok: false, reason: 'forbidden' }));
+      const e = this.env as { ADMIN_KEY?: string; OWNER_KEY?: string };
+      const key = url.searchParams.get('key') || '';
+      const ok = (!!e.ADMIN_KEY && key === e.ADMIN_KEY) || (!!e.OWNER_KEY && key === e.OWNER_KEY);
+      if (!ok) return cors(json({ ok: false, reason: 'forbidden' }));
+      if (url.searchParams.get('full') === '1') {
+        try { await this.state.storage.deleteAll(); } catch {}
+        this.lands.clear(); this.assets.clear(); this.assetsLoaded = false;
+        const w = JSON.stringify({ type: 'wiped' });
+        for (const peer of this.state.getWebSockets()) { try { peer.send(w); } catch {} } // live players reload into the fresh world
+        return cors(json({ ok: true, reset: 'full' }));
+      }
       await this.state.storage.delete('owner');
       await this.state.storage.delete('destroyable');
       return cors(json({ ok: true, reset: 'owner+destroyable' }));
