@@ -1,5 +1,14 @@
 const EMPTY_SCENE = JSON.stringify({ type: 'scene', nodes: [], variables: [], ts: 0 });
 
+// Inactivity TTL: if NOTHING touches a room (no connect, no message) for this long,
+// the next connect REBORNS it empty (all builds/scene/library/race/owner/assets wiped).
+// 14 days is long enough that a real, in-use world is never wiped between sessions
+// (people return within ~2 weeks), while truly abandoned forks are garbage-collected so
+// stale owners/builds don't linger forever. The lobby (figager) is NEVER wiped. Note: the
+// Visit grid already hides rooms with no reporter in ~45s — "gone from the grid" is purely
+// cosmetic and separate from this; data stays alive here until the 14-day TTL elapses.
+const ROOM_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+
 const cors = (res: Response): Response => {
   res.headers.set('Access-Control-Allow-Origin', '*');
   res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -51,6 +60,34 @@ export class Relay {
     for (const [k, v] of rows) m.set(k.slice(pre.length), v);
     this.lands.set(landId, m);
     return m;
+  }
+
+  // Mark the room as alive NOW. Called on every connect and every inbound message, so a
+  // room only goes stale after a continuous TTL window with zero traffic. Persisted (the
+  // wipe check on a later cold start reads it from storage, not an instance field).
+  async touch(): Promise<void> { try { await this.state.storage.put('lastSeen', Date.now()); } catch {} }
+
+  // Inactivity rebirth. If this room has had NO traffic for longer than ROOM_TTL_MS and is
+  // not the lobby (figager), erase its whole world so it is reborn empty: builds (b:*),
+  // assets (a:*), scene, library, race, owner, destroyable, published, thumb — everything
+  // except we re-stamp roomName + lastSeen. We deleteAll() (simplest + covers every key,
+  // incl. directory keys which only live on the singleton DO anyway) then restore identity.
+  // First-ever connect (no lastSeen yet) is NOT a wipe — touch() will stamp it.
+  async maybeWipeStale(roomName: string): Promise<void> {
+    if (roomName === 'figager') return; // never wipe the lobby
+    let lastSeen: number | undefined;
+    try { lastSeen = (await this.state.storage.get('lastSeen')) as number | undefined; } catch {}
+    if (typeof lastSeen !== 'number') return; // never seen before → nothing to wipe
+    if (Date.now() - lastSeen <= ROOM_TTL_MS) return; // still fresh
+    try {
+      await this.state.storage.deleteAll(); // builds, assets, scene, library, race, owner, destroyable, …
+    } catch {}
+    // drop hydrated in-memory caches so the reborn world doesn't re-seed old content
+    this.lands.clear();
+    this.assets.clear();
+    this.assetsLoaded = false;
+    try { await this.state.storage.put('roomName', roomName); } catch {}
+    try { await this.state.storage.put('lastSeen', Date.now()); } catch {}
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -135,6 +172,15 @@ export class Relay {
 
     // WebSocket upgrade → join the room.
     if ((request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
+      // Remember which room THIS DO is (the name only reaches us on the URL at connect;
+      // hibernation drops instance fields, so persist it). Used by the TTL wipe to spare
+      // the lobby.
+      const roomName = sanRoom(url.searchParams.get('room')) || 'figager';
+      // Inactivity rebirth: BEFORE seeding, if this room has been untouched longer than
+      // the TTL (and is not the lobby), wipe it so the joiner sees a fresh empty world.
+      await this.maybeWipeStale(roomName);
+      try { await this.state.storage.put('roomName', roomName); } catch {}
+      await this.touch(); // a connect counts as activity
       const pair = new WebSocketPair();
       const client = pair[0];
       const server = pair[1];
@@ -176,6 +222,7 @@ export class Relay {
 
   // Every inbound frame: auth-gate CONTENT writes, sniff for caching, fan out.
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    await this.touch(); // any inbound frame keeps the room alive (resets the inactivity TTL)
     const text = typeof message === 'string' ? message : new TextDecoder().decode(message);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let msg: any = null;
