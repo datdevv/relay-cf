@@ -125,11 +125,16 @@ export class Relay {
       const rows = (await this.state.storage.list({ prefix: 'dir:' })) as Map<string, any>;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const out: any[] = [];
+      const stale: string[] = [];
+      const KEEP_MS = 14 * 24 * 60 * 60 * 1000; // worlds stay listed (even idle) until their data TTL, so you can find the ones you made
       for (const [k, e] of rows) {
         let players = 0; for (const c in (e.clients || {})) if (now - e.clients[c] <= 45000) players++;
-        if (players > 0) out.push({ room: k.slice(4), players, destroyable: !!e.destroyable, hasScript: !!e.hasScript });
+        const ts = e.ts || 0;
+        if (players === 0 && now - ts > KEEP_MS) { stale.push(k); continue; } // forget long-dead worlds
+        out.push({ room: k.slice(4), players, destroyable: !!e.destroyable, hasScript: !!e.hasScript, idle: players === 0, ts });
       }
-      out.sort((a, b) => b.players - a.players || a.room.localeCompare(b.room));
+      if (stale.length) { try { await this.state.storage.delete(stale); } catch {} }
+      out.sort((a, b) => (b.players - a.players) || (b.ts - a.ts)); // live worlds first, then most-recently-active
       return cors(json({ rooms: out.slice(0, 60) }));
     }
     if (url.pathname === '/thumb') {
