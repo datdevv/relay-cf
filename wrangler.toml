@@ -2,6 +2,10 @@ name = "figager-relay"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
+# Hard cap CPU per invocation so a single request can never run away (relay ops use <1ms).
+[limits]
+cpu_ms = 50
+
 [[durable_objects.bindings]]
 name = "RELAY"
 class_name = "Relay"

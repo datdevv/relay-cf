@@ -30,6 +30,7 @@ export class Relay {
   // while CONTENT (scene/library/assets) stays shared in this one DO. lands:
   // landId -> (cell "x,y,z" -> {val,ts}); persisted as "b:<land>:<cell>". Lazy.
   lands: Map<string, Map<string, { val: unknown; ts: number }>>;
+  rate: WeakMap<WebSocket, { c: number; t: number }>; // per-socket message-rate guard (abuse / cost control)
 
   constructor(state: DurableObjectState, env: unknown) {
     this.state = state;
@@ -37,6 +38,7 @@ export class Relay {
     this.assets = new Map();
     this.assetsLoaded = false;
     this.lands = new Map();
+    this.rate = new WeakMap();
   }
 
   // Lazily hydrate textures from DO storage so CONTENT survives eviction / days
@@ -177,6 +179,8 @@ export class Relay {
 
     // WebSocket upgrade → join the room.
     if ((request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
+      // Cost/abuse guard: cap concurrent sockets per room so nobody can connection-bomb the DO.
+      if (this.state.getWebSockets().length >= 100) return cors(new Response('room full', { status: 429 }));
       // Remember which room THIS DO is (the name only reaches us on the URL at connect;
       // hibernation drops instance fields, so persist it). Used by the TTL wipe to spare
       // the lobby.
@@ -231,6 +235,13 @@ export class Relay {
 
   // Every inbound frame: auth-gate CONTENT writes, sniff for caching, fan out.
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    // --- abuse / cost guards: drop floods + absurd frames BEFORE any storage write ---
+    const _sz = typeof message === 'string' ? message.length : message.byteLength;
+    if (_sz > 2_000_000) return; // ignore absurdly large frames (legit op/asset frames are tiny)
+    const _now = Date.now();
+    let _r = this.rate.get(ws);
+    if (!_r || _now - _r.t > 3000) { _r = { c: 0, t: _now }; this.rate.set(ws, _r); }
+    if (++_r.c > 3000) { try { ws.close(1013, 'rate limit'); } catch {} return; } // sustained flood (>1k/s) -> disconnect this socket
     await this.touch(); // any inbound frame keeps the room alive (resets the inactivity TTL)
     const text = typeof message === 'string' ? message : new TextDecoder().decode(message);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
