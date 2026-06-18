@@ -11,7 +11,7 @@ export interface Env {
 // builds, owners, destroyable) start fresh. The old DOs are simply orphaned (idle =
 // free). Reversible — set it back to reach the old data. Rooms stay addressed by
 // their plain ?room id (this prefix is invisible to users).
-const ROOM_NS = 'g2';
+const ROOM_NS = 'g3';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
