@@ -77,6 +77,7 @@ export class Relay {
       for (const k in e.clients) if (now - e.clients[k] > 45000) delete e.clients[k];
       e.players = Object.keys(e.clients).length;
       if (typeof body.destroyable === 'boolean') e.destroyable = body.destroyable;
+      if (typeof body.hasScript === 'boolean') e.hasScript = body.hasScript;
       e.ts = now;
       await this.state.storage.put('dir:' + room, e);
       return cors(json({ ok: true, players: e.players }));
@@ -89,7 +90,7 @@ export class Relay {
       const out: any[] = [];
       for (const [k, e] of rows) {
         let players = 0; for (const c in (e.clients || {})) if (now - e.clients[c] <= 45000) players++;
-        if (players > 0) out.push({ room: k.slice(4), players, destroyable: !!e.destroyable });
+        if (players > 0) out.push({ room: k.slice(4), players, destroyable: !!e.destroyable, hasScript: !!e.hasScript });
       }
       out.sort((a, b) => b.players - a.players || a.room.localeCompare(b.room));
       return cors(json({ rooms: out.slice(0, 60) }));
@@ -167,6 +168,9 @@ export class Relay {
       const owner = (await this.state.storage.get('owner')) as string | undefined;
       const destroyable = (await this.state.storage.get('destroyable')) === true;
       ws.send(JSON.stringify({ type: 'roomState', owned: !!owner, destroyable }));
+      // Race course is room-wide content: replay the persisted course to late joiners.
+      const race = (await this.state.storage.get('race')) as string | undefined;
+      if (race) { try { ws.send(JSON.stringify({ type: 'race', race: JSON.parse(race) })); } catch {} }
     } catch {}
   }
 
@@ -214,6 +218,20 @@ export class Relay {
         const destroyable = (await this.state.storage.get('destroyable')) === true;
         if (!destroyable) return;
       }
+    }
+
+    // RACE course sync: the authored race (start/end/checkpoints) is room-wide
+    // content. Gate it EXACTLY like op/carry (authed owner OR destroyable room),
+    // persist it as a JSON string under "race", then let it fan out below so all
+    // peers update live. A non-owner in a read-only room is dropped (not stored,
+    // not forwarded).
+    if (msg && msg.type === 'race') {
+      const att = ws.deserializeAttachment() as { authed?: boolean } | null;
+      if (!(att && att.authed)) {
+        const destroyable = (await this.state.storage.get('destroyable')) === true;
+        if (!destroyable) return;
+      }
+      try { await this.state.storage.put('race', JSON.stringify(msg.race || null)); } catch {}
     }
 
     // CONTENT writes (scene/library/asset) require ownership once a room is
